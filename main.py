@@ -2,11 +2,13 @@ import sys
 import time
 import signal
 import argparse
+import os
 
 import numpy as np
 import torch
 import visdom
 import data
+import wandb
 from models import *
 from comm import CommNetMLP
 from utils import *
@@ -72,6 +74,8 @@ parser.add_argument('--load', default='', type=str,
                     help='load the model')
 parser.add_argument('--display', action="store_true", default=False,
                     help='Display environment state')
+parser.add_argument('--wandb_run', default=None, type=str,
+                    help='WandB run name')
 
 
 parser.add_argument('--random', action='store_true', default=False,
@@ -111,6 +115,9 @@ parser.add_argument('--share_weights', default=False, action='store_true',
 
 init_args_for_env(parser)
 args = parser.parse_args()
+
+wandb_run = wandb.init(project="ic3net", name=args.wandb_run, config=vars(args))
+wandb.config.update(args)  # Add all arguments to config
 
 if args.ic3net:
     args.commnet = 1
@@ -249,6 +256,29 @@ def run(num_epochs):
                     vis.line(np.asarray(v.data), np.asarray(log[v.x_axis].data[-len(v.data):]),
                     win=k, opts=dict(xlabel=v.x_axis, ylabel=k))
 
+        if wandb_run is not None:
+            def _vector_mean(value):
+                if torch.is_tensor(value):
+                    if value.numel() > 1:
+                        return value.detach().double().mean().item()
+                elif isinstance(value, (list, tuple, np.ndarray)):
+                    arr = np.asarray(value)
+                    if arr.size > 1:
+                        return float(arr.mean())
+                return None
+
+            payload = {'epoch': epoch, 'epoch_time': epoch_time}
+            # Only log keys that were computed in this epoch
+            for key in ['reward', 'enemy_reward', 'add_rate', 'success', 'steps_taken',
+                        'comm_action', 'enemy_comm', 'value_loss', 'action_loss', 'entropy']:
+                if key in stat:
+                    value = stat[key]
+                    payload[key] = value
+                    mean_value = _vector_mean(value)
+                    if mean_value is not None:
+                        payload[f'{key}_mean'] = mean_value
+            wandb.log(payload, step=epoch)
+
         if args.save_every and ep and args.save != '' and ep % args.save_every == 0:
             # fname, ext = args.save.split('.')
             # save(fname + '_' + str(ep) + '.' + ext)
@@ -258,11 +288,20 @@ def run(num_epochs):
             save(args.save)
 
 def save(path):
+    # If a directory is provided, drop the checkpoint inside it.
+    save_path = path
+    if os.path.isdir(path):
+        save_path = os.path.join(path, 'model.pt')
+    else:
+        dirname = os.path.dirname(path)
+        if dirname and not os.path.exists(dirname):
+            os.makedirs(dirname, exist_ok=True)
+
     d = dict()
     d['policy_net'] = policy_net.state_dict()
     d['log'] = log
     d['trainer'] = trainer.state_dict()
-    torch.save(d, path)
+    torch.save(d, save_path)
 
 def load(path):
     d = torch.load(path)

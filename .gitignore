@@ -103,3 +103,6 @@ ENV/
 # Models
 *.onnx
 *.pt
+
+.vscode
+jobs/
