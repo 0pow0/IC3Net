@@ -105,6 +105,8 @@ parser.add_argument('--comm_init', default='uniform', type=str,
                     help='how to initialise comm weights [uniform|zeros]')
 parser.add_argument('--hard_attn', default=False, action='store_true',
                     help='Whether to use hard attention: action - talk|silent')
+parser.add_argument('--comm_prob', type=float, default=None,
+                    help='Probability of communicating when using hard attention')
 parser.add_argument('--comm_action_one', default=False, action='store_true',
                     help='Whether to always talk, sanity check for hard attention.')
 parser.add_argument('--advantages_per_action', default=False, action='store_true',
