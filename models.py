@@ -20,7 +20,7 @@ class MLP(nn.Module):
         self.value_head = nn.Linear(args.hid_size, 1)
         self.tanh = nn.Tanh()
 
-    def forward(self, x, info={}):
+    def forward(self, x, info={}, return_hidden=False):
         x = self.tanh(self.affine1(x))
         h = self.tanh(sum([self.affine2(x), x]))
         v = self.value_head(h)
@@ -29,9 +29,13 @@ class MLP(nn.Module):
             action_mean = self.action_mean(h)
             action_log_std = self.action_log_std.expand_as(action_mean)
             action_std = torch.exp(action_log_std)
-            return (action_mean, action_log_std, action_std), v
+            outputs = (action_mean, action_log_std, action_std)
         else:
-            return [F.log_softmax(head(h), dim=-1) for head in self.heads], v
+            outputs = [F.log_softmax(head(h), dim=-1) for head in self.heads]
+
+        if return_hidden:
+            return outputs, v, h
+        return outputs, v
 
 
 class Random(nn.Module):
@@ -65,7 +69,7 @@ class RNN(MLP):
             del self.affine2
             self.lstm_unit = nn.LSTMCell(self.hid_size, self.hid_size)
 
-    def forward(self, x, info={}):
+    def forward(self, x, info={}, return_hidden=False):
         x, prev_hid = x
         encoded_x = self.affine1(x)
 
@@ -86,12 +90,35 @@ class RNN(MLP):
             action_mean = self.action_mean(next_hid)
             action_log_std = self.action_log_std.expand_as(action_mean)
             action_std = torch.exp(action_log_std)
-            return (action_mean, action_log_std, action_std), v, ret
+            action_outputs = (action_mean, action_log_std, action_std)
         else:
-            return [F.log_softmax(head(next_hid), dim=-1) for head in self.heads], v, ret
+            action_outputs = [F.log_softmax(head(next_hid), dim=-1) for head in self.heads]
+
+        if return_hidden:
+            return action_outputs, v, ret, next_hid
+        return action_outputs, v, ret
 
     def init_hidden(self, batch_size):
         # dim 0 = num of layers * num of direction
         return tuple(( torch.zeros(batch_size * self.nagents, self.hid_size, requires_grad=True),
                        torch.zeros(batch_size * self.nagents, self.hid_size, requires_grad=True)))
 
+
+class MVENetwork(nn.Module):
+    """
+    Simple MVE network that estimates the marginal value of a message.
+    Input: concatenated agent hidden state and its message (scalar).
+    Output: scalar value estimate.
+    """
+    def __init__(self, args, message_dim=1):
+        super(MVENetwork, self).__init__()
+        self.fc1 = nn.Linear(args.hid_size + message_dim, args.hid_size)
+        self.fc2 = nn.Linear(args.hid_size, args.hid_size)
+        self.out = nn.Linear(args.hid_size, 1)
+        self.act = nn.Tanh()
+
+    def forward(self, hidden, message):
+        x = torch.cat([hidden, message], dim=-1)
+        x = self.act(self.fc1(x))
+        x = self.act(self.fc2(x))
+        return self.out(x).squeeze(-1)

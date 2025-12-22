@@ -1,14 +1,36 @@
 from collections import namedtuple
 from inspect import getargspec
+import random
 import numpy as np
 import torch
 from torch import optim
 import torch.nn as nn
+from models import MVENetwork
 from utils import *
 from action_utils import *
 
 Transition = namedtuple('Transition', ('state', 'action', 'action_out', 'value', 'episode_mask', 'episode_mini_mask', 'next_state',
                                        'reward', 'misc'))
+
+
+class ReplayBuffer(object):
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def push(self, item):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(item)
+        else:
+            self.buffer[self.position] = item
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
 
 
 class Trainer(object):
@@ -21,6 +43,15 @@ class Trainer(object):
         self.optimizer = optim.RMSprop(policy_net.parameters(),
             lr = args.lrate, alpha=0.97, eps=1e-6)
         self.params = [p for p in self.policy_net.parameters()]
+        self.mve_enabled = getattr(args, 'enable_mve', False)
+        if self.mve_enabled:
+            self.mve_net = MVENetwork(args)
+            self.mve_optimizer = optim.Adam(self.mve_net.parameters(), lr=args.mve_lr)
+            self.mve_buffer = ReplayBuffer(args.mve_buffer_size)
+        else:
+            self.mve_net = None
+            self.mve_optimizer = None
+            self.mve_buffer = None
 
 
     def get_episode(self, epoch):
@@ -42,6 +73,9 @@ class Trainer(object):
 
         for t in range(self.args.max_steps):
             misc = dict()
+            hidden_repr = None
+            comm_action_snapshot = None
+            prev_hid_for_buffer = None
             if t == 0 and self.args.hard_attn and self.args.commnet:
                 info['comm_action'] = np.zeros(self.args.nagents, dtype=int)
 
@@ -50,8 +84,13 @@ class Trainer(object):
                 if self.args.rnn_type == 'LSTM' and t == 0:
                     prev_hid = self.policy_net.init_hidden(batch_size=state.shape[0])
 
+                if self.mve_enabled:
+                    prev_hid_for_buffer = self._detach_hidden_state(prev_hid)
                 x = [state, prev_hid]
-                action_out, value, prev_hid = self.policy_net(x, info)
+                if self.mve_enabled:
+                    action_out, value, prev_hid, hidden_repr = self.policy_net(x, info, return_hidden=True)
+                else:
+                    action_out, value, prev_hid = self.policy_net(x, info)
 
                 if (t + 1) % self.args.detach_gap == 0:
                     if self.args.rnn_type == 'LSTM':
@@ -60,7 +99,10 @@ class Trainer(object):
                         prev_hid = prev_hid.detach()
             else:
                 x = state
-                action_out, value = self.policy_net(x, info)
+                if self.mve_enabled:
+                    action_out, value, hidden_repr = self.policy_net(x, info, return_hidden=True)
+                else:
+                    action_out, value = self.policy_net(x, info)
 
             action = select_action(self.args, action_out)
             action, actual = translate_action(self.args, self.env, action)
@@ -69,6 +111,7 @@ class Trainer(object):
             # store comm_action in info for next step
             if self.args.hard_attn and self.args.commnet:
                 info['comm_action'] = action[-1] if not self.args.comm_action_one else np.ones(self.args.nagents, dtype=int)
+                comm_action_snapshot = np.array(info['comm_action'], copy=True)
 
                 stat['comm_action'] = stat.get('comm_action', 0) + info['comm_action'][:self.args.nfriendly]
                 if hasattr(self.args, 'enemy_comm') and self.args.enemy_comm:
@@ -102,6 +145,8 @@ class Trainer(object):
                 self.env.display()
 
             trans = Transition(state, action, action_out, value, episode_mask, episode_mini_mask, next_state, reward, misc)
+            if self.mve_enabled:
+                self._store_mve_transition(state, value, hidden_repr, comm_action_snapshot, prev_hid_for_buffer, misc)
             episode.append(trans)
             state = next_state
             if done:
@@ -124,6 +169,27 @@ class Trainer(object):
         if hasattr(self.env, 'get_stat'):
             merge_stat(self.env.get_stat(), stat)
         return (episode, stat)
+
+    def _detach_hidden_state(self, hidden):
+        if hidden is None:
+            return None
+        if isinstance(hidden, tuple):
+            return tuple(h.detach().clone() for h in hidden)
+        return hidden.detach().clone()
+
+    def _store_mve_transition(self, state, value, hidden_repr, comm_action, prev_hidden, misc):
+        if self.mve_buffer is None or hidden_repr is None or comm_action is None:
+            return
+
+        sample = {
+            'state': state.detach().clone(),
+            'value': value.detach().clone(),
+            'hidden_state': hidden_repr.detach().clone(),
+            'comm_action': np.array(comm_action, copy=True),
+            'prev_hidden': self._detach_hidden_state(prev_hidden),
+            'alive_mask': misc.get('alive_mask', None)
+        }
+        self.mve_buffer.push(sample)
 
     def compute_grad(self, batch):
         stat = dict()
@@ -224,6 +290,84 @@ class Trainer(object):
 
         return stat
 
+    def _compute_delta_q(self, sample, agent_idx):
+        comm_action = sample.get('comm_action', None)
+        if comm_action is None:
+            return None
+
+        state = sample['state']
+        value = sample['value']
+        prev_hidden = sample.get('prev_hidden', None)
+        alive_mask = sample.get('alive_mask', None)
+
+        if alive_mask is not None:
+            mask = np.asarray(alive_mask).reshape(-1)
+            if agent_idx >= mask.shape[0] or mask[agent_idx] == 0:
+                return None
+
+        q_real = value.view(state.shape[0], self.args.nagents, -1)[0, agent_idx, 0].detach()
+
+        null_comm = np.array(comm_action, copy=True)
+        null_comm[agent_idx] = 0
+        info = {'comm_action': null_comm}
+        if alive_mask is not None:
+            info['alive_mask'] = alive_mask
+
+        with torch.no_grad():
+            if self.args.recurrent:
+                hidden_in = prev_hidden
+                if hidden_in is None:
+                    if self.args.rnn_type == 'LSTM':
+                        hidden_in = self.policy_net.init_hidden(batch_size=state.shape[0])
+                    else:
+                        hidden_in = torch.zeros(state.shape[0], self.args.nagents, self.args.hid_size, dtype=state.dtype)
+                _, null_value, _ = self.policy_net([state, hidden_in], info)
+            else:
+                _, null_value = self.policy_net(state, info)
+
+        q_null = null_value.view(state.shape[0], self.args.nagents, -1)[0, agent_idx, 0]
+        return q_real - q_null
+
+    def train_mve_step(self):
+        if self.mve_buffer is None or self.mve_net is None:
+            return None
+
+        if len(self.mve_buffer) < self.args.mve_batch_size:
+            return None
+
+        transitions = self.mve_buffer.sample(self.args.mve_batch_size)
+        preds = []
+        targets = []
+        for sample in transitions:
+            comm_action = sample.get('comm_action', None)
+            hidden_state = sample.get('hidden_state', None)
+
+            if comm_action is None or hidden_state is None:
+                continue
+
+            hidden_state = hidden_state.view(-1, self.args.nagents, self.args.hid_size)
+            for agent_idx in range(self.args.nagents):
+                delta_q = self._compute_delta_q(sample, agent_idx)
+                if delta_q is None:
+                    continue
+                h_i = hidden_state[0, agent_idx].unsqueeze(0)
+                msg = torch.tensor([[comm_action[agent_idx]]], dtype=h_i.dtype)
+                preds.append(self.mve_net(h_i, msg))
+                targets.append(delta_q.view(1))
+
+        if len(preds) == 0:
+            return None
+
+        preds = torch.cat(preds, dim=0).squeeze()
+        targets = torch.cat(targets, dim=0).squeeze()
+        loss = (preds - targets.detach()).pow(2).mean()
+
+        self.mve_optimizer.zero_grad()
+        loss.backward()
+        self.mve_optimizer.step()
+
+        return {'mve_loss': loss.item(), 'mve_samples': preds.numel()}
+
     def run_batch(self, epoch):
         batch = []
         self.stats = dict()
@@ -256,7 +400,15 @@ class Trainer(object):
         return stat
 
     def state_dict(self):
-        return self.optimizer.state_dict()
+        state = {'optimizer': self.optimizer.state_dict()}
+        if self.mve_optimizer is not None:
+            state['mve_optimizer'] = self.mve_optimizer.state_dict()
+        return state
 
     def load_state_dict(self, state):
-        self.optimizer.load_state_dict(state)
+        if isinstance(state, dict) and 'optimizer' in state:
+            self.optimizer.load_state_dict(state['optimizer'])
+            if self.mve_optimizer is not None and 'mve_optimizer' in state:
+                self.mve_optimizer.load_state_dict(state['mve_optimizer'])
+        else:
+            self.optimizer.load_state_dict(state)

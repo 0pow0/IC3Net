@@ -131,7 +131,7 @@ class CommNetMLP(nn.Module):
         return x, hidden_state, cell_state
 
 
-    def forward(self, x, info={}):
+    def forward(self, x, info={}, return_hidden=False):
         # TODO: Update dimensions
         """Forward function for CommNet class, expects state, previous hidden
         and communication tensor.
@@ -243,8 +243,13 @@ class CommNetMLP(nn.Module):
             action = [F.log_softmax(head(h), dim=-1) for head in self.heads]
 
         if self.args.recurrent:
-            return action, value_head, (hidden_state.clone(), cell_state.clone())
+            outputs = (action, value_head, (hidden_state.clone(), cell_state.clone()))
+            if return_hidden:
+                outputs = (*outputs, h)
+            return outputs
         else:
+            if return_hidden:
+                return action, value_head, h
             return action, value_head
 
     def init_weights(self, m):
@@ -255,4 +260,3 @@ class CommNetMLP(nn.Module):
         # dim 0 = num of layers * num of direction
         return tuple(( torch.zeros(batch_size * self.nagents, self.hid_size, requires_grad=True),
                        torch.zeros(batch_size * self.nagents, self.hid_size, requires_grad=True)))
-

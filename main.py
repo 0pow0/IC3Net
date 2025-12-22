@@ -52,6 +52,16 @@ parser.add_argument('--entr', type=float, default=0,
                     help='entropy regularization coeff')
 parser.add_argument('--value_coeff', type=float, default=0.01,
                     help='coeff for value loss term')
+parser.add_argument('--enable_mve', action='store_true', default=False,
+                    help='Enable MVE counterfactual value learning phase.')
+parser.add_argument('--mve_buffer_size', type=int, default=50000,
+                    help='Replay buffer size for MVE training.')
+parser.add_argument('--mve_batch_size', type=int, default=64,
+                    help='Batch size for MVE updates.')
+parser.add_argument('--mve_train_steps', type=int, default=0,
+                    help='Number of gradient steps for MVE training.')
+parser.add_argument('--mve_lr', type=float, default=1e-3,
+                    help='Learning rate for MVE network.')
 # environment
 parser.add_argument('--env_name', default="Cartpole",
                     help='name of the environment to run')
@@ -162,6 +172,10 @@ if args.commnet and (args.recurrent or args.rnn_type == 'LSTM'):
 
 
 parse_action_args(args)
+
+if args.enable_mve and args.nprocesses > 1:
+    print("MVE training currently supports only nprocesses=1. Disabling MVE.")
+    args.enable_mve = False
 
 if args.seed == -1:
     args.seed = np.random.randint(0,10000)
@@ -281,36 +295,46 @@ def run(num_epochs):
                         payload[f'{key}_mean'] = mean_value
             wandb.log(payload, step=epoch)
 
-        if args.save_every and ep and args.save != '' and ep % args.save_every == 0:
-            # fname, ext = args.save.split('.')
-            # save(fname + '_' + str(ep) + '.' + ext)
-            save(args.save + '_' + str(ep))
+def run_mve_phase():
+    if not args.enable_mve or args.mve_train_steps <= 0:
+        return
 
-        if args.save != '':
-            save(args.save)
+    if not hasattr(trainer, 'train_mve_step'):
+        print("MVE components not initialized; skipping MVE phase.")
+        return
+
+    print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {getattr(trainer, 'mve_buffer', None) and len(trainer.mve_buffer)}")
+    for step in range(args.mve_train_steps):
+        res = trainer.train_mve_step()
+        if res is None:
+            print("MVE training halted early due to insufficient samples.")
+            break
+        if (step + 1) % max(1, args.mve_train_steps // 10) == 0 or step == args.mve_train_steps - 1:
+            print(f"[MVE] Step {step + 1}/{args.mve_train_steps}, loss {res['mve_loss']:.4f}, samples {res['mve_samples']}")
 
 def save(path):
-    # If a directory is provided, drop the checkpoint inside it.
-    save_path = path
-    if os.path.isdir(path):
-        save_path = os.path.join(path, 'model.pt')
-    else:
-        dirname = os.path.dirname(path)
-        if dirname and not os.path.exists(dirname):
-            os.makedirs(dirname, exist_ok=True)
+    # Always treat path as directory and write model.pt inside it
+    os.makedirs(path, exist_ok=True)
+    save_path = os.path.join(path, 'model.pt')
 
+    target_trainer = trainer.trainer if isinstance(trainer, MultiProcessTrainer) else trainer
     d = dict()
     d['policy_net'] = policy_net.state_dict()
     d['log'] = log
     d['trainer'] = trainer.state_dict()
+    if hasattr(target_trainer, 'mve_net') and target_trainer.mve_net is not None:
+        d['mve_net'] = target_trainer.mve_net.state_dict()
     torch.save(d, save_path)
 
 def load(path):
-    d = torch.load(path)
+    d = torch.load(path, weights_only=False)
     # log.clear()
     policy_net.load_state_dict(d['policy_net'])
     log.update(d['log'])
     trainer.load_state_dict(d['trainer'])
+    target_trainer = trainer.trainer if isinstance(trainer, MultiProcessTrainer) else trainer
+    if 'mve_net' in d and hasattr(target_trainer, 'mve_net') and target_trainer.mve_net is not None:
+        target_trainer.mve_net.load_state_dict(d['mve_net'])
 
 def signal_handler(signal, frame):
         print('You pressed Ctrl+C! Exiting gracefully.')
@@ -324,6 +348,7 @@ if args.load != '':
     load(args.load)
 
 run(args.num_epochs)
+run_mve_phase()
 if args.display:
     env.end_display()
 
