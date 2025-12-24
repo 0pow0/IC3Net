@@ -226,6 +226,30 @@ log['entropy'] = LogField(list(), True, 'epoch', 'num_steps')
 if args.plot:
     vis = visdom.Visdom(env=args.plot_env)
 
+
+def _print_progress(step, total, prefix, metrics=None):
+    bar_len = 30
+    filled = int(bar_len * step / float(total))
+    bar = '█' * filled + '-' * (bar_len - filled)
+    percent = 100.0 * step / float(total)
+    end_char = '\n' if step >= total else '\r'
+    metrics_str = ''
+    if metrics:
+        parts = []
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            if isinstance(value, float):
+                parts.append(f'{key}={value:.4f}')
+            elif isinstance(value, (int, np.integer)):
+                parts.append(f'{key}={value}')
+            else:
+                parts.append(f'{key}={value}')
+        if parts:
+            metrics_str = ' ' + ' '.join(parts)
+    sys.stdout.write(f'{prefix} |{bar}| {percent:6.2f}% ({step}/{total}){metrics_str}{end_char}')
+    sys.stdout.flush()
+
 def run(num_epochs):
     for ep in range(num_epochs):
         epoch_begin_time = time.time()
@@ -294,6 +318,7 @@ def run(num_epochs):
                     if mean_value is not None:
                         payload[f'{key}_mean'] = mean_value
             wandb.log(payload, step=epoch)
+        _print_progress(ep + 1, num_epochs, 'Training')
 
 def run_mve_phase():
     if not args.enable_mve or args.mve_train_steps <= 0:
@@ -304,13 +329,29 @@ def run_mve_phase():
         return
 
     print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {getattr(trainer, 'mve_buffer', None) and len(trainer.mve_buffer)}")
+    mve_logs = []
     for step in range(args.mve_train_steps):
         res = trainer.train_mve_step()
         if res is None:
             print("MVE training halted early due to insufficient samples.")
             break
-        if (step + 1) % max(1, args.mve_train_steps // 10) == 0 or step == args.mve_train_steps - 1:
-            print(f"[MVE] Step {step + 1}/{args.mve_train_steps}, loss {res['mve_loss']:.4f}, samples {res['mve_samples']}")
+        mve_logs.append(res)
+        _print_progress(step + 1, args.mve_train_steps, 'MVE    ', metrics=res)
+        if wandb_run is not None:
+            payload = {'mve_step': step + 1}
+            payload.update(res)
+            wandb.log(payload, step=args.num_epochs + step + 1)
+    if args.mve_train_steps > 0:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+    if mve_logs and wandb_run is not None:
+        avg_loss = np.mean([entry['mve_loss'] for entry in mve_logs if 'mve_loss' in entry])
+        total_samples = sum(entry.get('mve_samples', 0) for entry in mve_logs)
+        wandb.log({
+            'mve_avg_loss': avg_loss,
+            'mve_total_samples': total_samples,
+            'mve_steps_completed': len(mve_logs)
+        }, step=args.num_epochs + len(mve_logs))
 
 def save(path):
     # Always treat path as directory and write model.pt inside it
