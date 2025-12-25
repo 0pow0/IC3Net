@@ -62,6 +62,14 @@ parser.add_argument('--mve_train_steps', type=int, default=0,
                     help='Number of gradient steps for MVE training.')
 parser.add_argument('--mve_lr', type=float, default=1e-3,
                     help='Learning rate for MVE network.')
+parser.add_argument('--enable_unlearning', action='store_true', default=False,
+                    help='Enable value-aware unlearning (phase 3).')
+parser.add_argument('--unlearn_episodes', type=int, default=0,
+                    help='Number of episodes to run during value-aware unlearning.')
+parser.add_argument('--unlearn_lr', type=float, default=None,
+                    help='Learning rate for value-aware unlearning (defaults to lrate).')
+parser.add_argument('--unlearn_lambda', type=float, default=0.0,
+                    help='Sparsity penalty applied to message magnitude during unlearning.')
 # environment
 parser.add_argument('--env_name', default="Cartpole",
                     help='name of the environment to run')
@@ -176,6 +184,18 @@ parse_action_args(args)
 if args.enable_mve and args.nprocesses > 1:
     print("MVE training currently supports only nprocesses=1. Disabling MVE.")
     args.enable_mve = False
+
+if args.enable_unlearning and args.nprocesses > 1:
+    print("Value-aware unlearning currently supports only nprocesses=1. Disabling unlearning.")
+    args.enable_unlearning = False
+
+if args.enable_unlearning and not args.enable_mve:
+    print("Value-aware unlearning requires MVE. Disabling unlearning.")
+    args.enable_unlearning = False
+
+if args.enable_unlearning and not (args.commnet and args.hard_attn):
+    print("Value-aware unlearning currently supports hard-attention communication. Disabling unlearning.")
+    args.enable_unlearning = False
 
 if args.seed == -1:
     args.seed = np.random.randint(0,10000)
@@ -330,6 +350,7 @@ def run_mve_phase():
 
     print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {getattr(trainer, 'mve_buffer', None) and len(trainer.mve_buffer)}")
     mve_logs = []
+    next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
     for step in range(args.mve_train_steps):
         res = trainer.train_mve_step()
         if res is None:
@@ -338,20 +359,61 @@ def run_mve_phase():
         mve_logs.append(res)
         _print_progress(step + 1, args.mve_train_steps, 'MVE    ', metrics=res)
         if wandb_run is not None:
+            next_wandb_step += 1
             payload = {'mve_step': step + 1}
             payload.update(res)
-            wandb.log(payload, step=args.num_epochs + step + 1)
+            wandb.log(payload, step=next_wandb_step)
     if args.mve_train_steps > 0:
         sys.stdout.write('\n')
         sys.stdout.flush()
     if mve_logs and wandb_run is not None:
         avg_loss = np.mean([entry['mve_loss'] for entry in mve_logs if 'mve_loss' in entry])
         total_samples = sum(entry.get('mve_samples', 0) for entry in mve_logs)
+        next_wandb_step += 1
         wandb.log({
             'mve_avg_loss': avg_loss,
             'mve_total_samples': total_samples,
             'mve_steps_completed': len(mve_logs)
-        }, step=args.num_epochs + len(mve_logs))
+        }, step=next_wandb_step)
+
+def run_unlearning_phase():
+    if not args.enable_unlearning or args.unlearn_episodes <= 0:
+        return
+
+    target_trainer = trainer.trainer if isinstance(trainer, MultiProcessTrainer) else trainer
+    if not hasattr(target_trainer, 'train_value_unlearning_episode') or target_trainer.unlearn_optimizer is None:
+        print("Unlearning components not initialized; skipping value-aware unlearning.")
+        return
+
+    print(f"Starting value-aware unlearning for {args.unlearn_episodes} episodes.")
+    unlearn_logs = []
+    next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
+    for ep in range(args.unlearn_episodes):
+        res = target_trainer.train_value_unlearning_episode(ep)
+        if res is None:
+            print("Unlearning halted early due to missing samples or comm actions.")
+            break
+        unlearn_logs.append(res)
+        _print_progress(ep + 1, args.unlearn_episodes, 'UNLEARN', metrics=res)
+        if wandb_run is not None:
+            next_wandb_step += 1
+            payload = {'unlearn_episode': ep + 1}
+            payload.update(res)
+            wandb.log(payload, step=next_wandb_step)
+
+    if args.unlearn_episodes > 0:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    if unlearn_logs and wandb_run is not None:
+        avg_loss = np.mean([entry['unlearn_loss'] for entry in unlearn_logs if 'unlearn_loss' in entry])
+        total_samples = sum(entry.get('unlearn_samples', 0) for entry in unlearn_logs)
+        next_wandb_step += 1
+        wandb.log({
+            'unlearn_avg_loss': avg_loss,
+            'unlearn_total_samples': total_samples,
+            'unlearn_episodes_completed': len(unlearn_logs)
+        }, step=next_wandb_step)
 
 def save(path):
     # Always treat path as directory and write model.pt inside it
@@ -390,6 +452,7 @@ if args.load != '':
 
 run(args.num_epochs)
 run_mve_phase()
+run_unlearning_phase()
 if args.display:
     env.end_display()
 

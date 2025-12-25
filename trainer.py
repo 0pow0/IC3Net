@@ -53,6 +53,14 @@ class Trainer(object):
             self.mve_optimizer = None
             self.mve_buffer = None
 
+        self.unlearning_enabled = getattr(args, 'enable_unlearning', False) and self.mve_enabled
+        if self.unlearning_enabled:
+            lr = args.unlearn_lr if getattr(args, 'unlearn_lr', None) not in (None, 0) else args.lrate
+            self.unlearn_optimizer = optim.RMSprop(policy_net.parameters(),
+                lr = lr, alpha=0.97, eps=1e-6)
+        else:
+            self.unlearn_optimizer = None
+
 
     def get_episode(self, epoch):
         episode = []
@@ -122,6 +130,11 @@ class Trainer(object):
                 misc['alive_mask'] = info['alive_mask'].reshape(reward.shape)
             else:
                 misc['alive_mask'] = np.ones_like(reward)
+
+            if hidden_repr is not None:
+                misc['hidden_repr'] = hidden_repr.detach().clone()
+            if comm_action_snapshot is not None:
+                misc['comm_action'] = np.array(comm_action_snapshot, copy=True)
 
             # env should handle this make sure that reward for dead agents is not counted
             # reward = reward * misc['alive_mask']
@@ -368,6 +381,70 @@ class Trainer(object):
 
         return {'mve_loss': loss.item(), 'mve_samples': preds.numel()}
 
+    def train_value_unlearning_episode(self, epoch):
+        if not self.unlearning_enabled or self.unlearn_optimizer is None or self.mve_net is None:
+            return None
+
+        # Only applicable when communication actions are present (hard attention path).
+        comm_head_idx = self.args.dim_actions - 1 if self.args.hard_attn and self.args.commnet else None
+        if comm_head_idx is None or comm_head_idx >= len(self.args.num_actions):
+            return None
+
+        self.policy_net.train()
+        self.mve_net.eval()
+        episode, _ = self.get_episode(epoch)
+        if len(episode) == 0:
+            return None
+
+        loss_terms = []
+        samples = 0
+        for trans in episode:
+            misc = trans.misc if isinstance(trans.misc, dict) else dict()
+            hidden_repr = misc.get('hidden_repr', None)
+            comm_action = misc.get('comm_action', None)
+            alive_mask = misc.get('alive_mask', None)
+
+            if hidden_repr is None or comm_action is None:
+                continue
+
+            if trans.action_out is None or len(trans.action_out) <= comm_head_idx:
+                continue
+
+            comm_logits = trans.action_out[comm_head_idx]
+            log_probs = comm_logits.view(-1, self.args.nagents, self.args.num_actions[comm_head_idx])
+            hidden_repr = hidden_repr.view(-1, self.args.nagents, self.args.hid_size)
+            comm_action_arr = np.asarray(comm_action).reshape(-1)
+            alive_arr = np.asarray(alive_mask).reshape(-1) if alive_mask is not None else None
+
+            for agent_idx in range(self.args.nagents):
+                if agent_idx >= comm_action_arr.shape[0]:
+                    continue
+                if alive_arr is not None and (agent_idx >= alive_arr.shape[0] or alive_arr[agent_idx] == 0):
+                    continue
+
+                msg_val = comm_action_arr[agent_idx]
+                msg_tensor = torch.tensor([[msg_val]], dtype=hidden_repr.dtype, device=hidden_repr.device)
+                with torch.no_grad():
+                    value_est = self.mve_net(hidden_repr[:, agent_idx, :].detach(), msg_tensor).squeeze()
+
+                log_prob = log_probs[:, agent_idx, int(msg_val)].squeeze()
+                advantage = value_est - self.args.unlearn_lambda * torch.abs(msg_tensor.squeeze())
+                loss_terms.append(-advantage * log_prob)
+                samples += 1
+
+        if samples == 0 or len(loss_terms) == 0:
+            return None
+
+        loss = torch.stack(loss_terms).mean()
+        self.unlearn_optimizer.zero_grad()
+        loss.backward()
+        for p in self.params:
+            if p._grad is not None:
+                p._grad.data /= samples
+        self.unlearn_optimizer.step()
+
+        return {'unlearn_loss': loss.item(), 'unlearn_samples': samples}
+
     def run_batch(self, epoch):
         batch = []
         self.stats = dict()
@@ -403,6 +480,8 @@ class Trainer(object):
         state = {'optimizer': self.optimizer.state_dict()}
         if self.mve_optimizer is not None:
             state['mve_optimizer'] = self.mve_optimizer.state_dict()
+        if self.unlearn_optimizer is not None:
+            state['unlearn_optimizer'] = self.unlearn_optimizer.state_dict()
         return state
 
     def load_state_dict(self, state):
@@ -410,5 +489,7 @@ class Trainer(object):
             self.optimizer.load_state_dict(state['optimizer'])
             if self.mve_optimizer is not None and 'mve_optimizer' in state:
                 self.mve_optimizer.load_state_dict(state['mve_optimizer'])
+            if self.unlearn_optimizer is not None and 'unlearn_optimizer' in state:
+                self.unlearn_optimizer.load_state_dict(state['unlearn_optimizer'])
         else:
             self.optimizer.load_state_dict(state)
