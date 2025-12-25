@@ -247,6 +247,24 @@ if args.plot:
     vis = visdom.Visdom(env=args.plot_env)
 
 
+def _vector_mean(value):
+    if torch.is_tensor(value):
+        if value.numel() > 1:
+            return value.detach().double().mean().item()
+    elif isinstance(value, (list, tuple, np.ndarray)):
+        arr = np.asarray(value)
+        if arr.size > 1:
+            return float(arr.mean())
+    return None
+
+
+def _add_metric(payload, key, value):
+    payload[key] = value
+    mean_value = _vector_mean(value)
+    if mean_value is not None:
+        payload[f'{key}_mean'] = mean_value
+
+
 def _print_progress(step, total, prefix, metrics=None):
     bar_len = 30
     filled = int(bar_len * step / float(total))
@@ -317,26 +335,12 @@ def run(num_epochs):
                     win=k, opts=dict(xlabel=v.x_axis, ylabel=k))
 
         if wandb_run is not None:
-            def _vector_mean(value):
-                if torch.is_tensor(value):
-                    if value.numel() > 1:
-                        return value.detach().double().mean().item()
-                elif isinstance(value, (list, tuple, np.ndarray)):
-                    arr = np.asarray(value)
-                    if arr.size > 1:
-                        return float(arr.mean())
-                return None
-
             payload = {'epoch': epoch, 'epoch_time': epoch_time}
             # Only log keys that were computed in this epoch
             for key in ['reward', 'enemy_reward', 'add_rate', 'success', 'steps_taken',
                         'comm_action', 'enemy_comm', 'value_loss', 'action_loss', 'entropy']:
                 if key in stat:
-                    value = stat[key]
-                    payload[key] = value
-                    mean_value = _vector_mean(value)
-                    if mean_value is not None:
-                        payload[f'{key}_mean'] = mean_value
+                    _add_metric(payload, key, stat[key])
             wandb.log(payload, step=epoch)
         _print_progress(ep + 1, num_epochs, 'Training')
 
@@ -398,7 +402,8 @@ def run_unlearning_phase():
         if wandb_run is not None:
             next_wandb_step += 1
             payload = {'unlearn_episode': ep + 1}
-            payload.update(res)
+            for key, value in res.items():
+                _add_metric(payload, key, value)
             wandb.log(payload, step=next_wandb_step)
 
     if args.unlearn_episodes > 0:
@@ -408,12 +413,31 @@ def run_unlearning_phase():
     if unlearn_logs and wandb_run is not None:
         avg_loss = np.mean([entry['unlearn_loss'] for entry in unlearn_logs if 'unlearn_loss' in entry])
         total_samples = sum(entry.get('unlearn_samples', 0) for entry in unlearn_logs)
+        metric_names = set()
+        for entry in unlearn_logs:
+            metric_names.update(entry.keys())
         next_wandb_step += 1
-        wandb.log({
+        summary_payload = {
             'unlearn_avg_loss': avg_loss,
             'unlearn_total_samples': total_samples,
             'unlearn_episodes_completed': len(unlearn_logs)
-        }, step=next_wandb_step)
+        }
+        # Aggregate any additional metrics returned during unlearning.
+        for key in metric_names:
+            if key == 'unlearn_loss':
+                continue
+            values = [entry[key] for entry in unlearn_logs if key in entry]
+            numeric_values = []
+            for val in values:
+                mean_val = _vector_mean(val)
+                if mean_val is not None:
+                    numeric_values.append(mean_val)
+                elif isinstance(val, (int, float, np.floating)):
+                    numeric_values.append(float(val))
+            if numeric_values:
+                summary_payload[f'{key}_episode_mean'] = float(np.mean(numeric_values))
+
+        wandb.log(summary_payload, step=next_wandb_step)
 
 def save(path):
     # Always treat path as directory and write model.pt inside it
