@@ -390,54 +390,51 @@ def run_unlearning_phase():
         return
 
     print(f"Starting value-aware unlearning for {args.unlearn_episodes} episodes.")
-    unlearn_logs = []
+    stat = dict()
+    episodes_completed = 0
     next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
+    metric_keys = ['reward', 'enemy_reward', 'add_rate', 'success', 'steps_taken',
+                   'comm_action', 'enemy_comm', 'value_loss', 'action_loss', 'entropy']
     for ep in range(args.unlearn_episodes):
         res = target_trainer.train_value_unlearning_episode(ep)
         if res is None:
             print("Unlearning halted early due to missing samples or comm actions.")
             break
-        unlearn_logs.append(res)
+        res = dict(res)
+        res.setdefault('num_episodes', 1)
+        merge_stat(res, stat)
+        episodes_completed += 1
         _print_progress(ep + 1, args.unlearn_episodes, 'UNLEARN', metrics=res)
-        if wandb_run is not None:
-            next_wandb_step += 1
-            payload = {'unlearn_episode': ep + 1}
-            for key, value in res.items():
-                _add_metric(payload, key, value)
-            wandb.log(payload, step=next_wandb_step)
 
-    if args.unlearn_episodes > 0:
-        sys.stdout.write('\n')
-        sys.stdout.flush()
+    if episodes_completed == 0:
+        return
 
-    if unlearn_logs and wandb_run is not None:
-        avg_loss = np.mean([entry['unlearn_loss'] for entry in unlearn_logs if 'unlearn_loss' in entry])
-        total_samples = sum(entry.get('unlearn_samples', 0) for entry in unlearn_logs)
-        metric_names = set()
-        for entry in unlearn_logs:
-            metric_names.update(entry.keys())
+    # Normalize aggregated stats using the same divide_by logic as training.
+    for key, field in log.items():
+        if key == 'epoch' or field.divide_by is None:
+            continue
+        if key in stat and field.divide_by in stat and stat[field.divide_by] > 0:
+            stat[key] = stat[key] / stat[field.divide_by]
+
+    # Log aggregated unlearning metrics once, mirroring training's wandb payload.
+    if wandb_run is not None:
         next_wandb_step += 1
-        summary_payload = {
-            'unlearn_avg_loss': avg_loss,
-            'unlearn_total_samples': total_samples,
-            'unlearn_episodes_completed': len(unlearn_logs)
+        payload = {
+            'unlearn_episodes_completed': episodes_completed
         }
-        # Aggregate any additional metrics returned during unlearning.
-        for key in metric_names:
-            if key == 'unlearn_loss':
-                continue
-            values = [entry[key] for entry in unlearn_logs if key in entry]
-            numeric_values = []
-            for val in values:
-                mean_val = _vector_mean(val)
-                if mean_val is not None:
-                    numeric_values.append(mean_val)
-                elif isinstance(val, (int, float, np.floating)):
-                    numeric_values.append(float(val))
-            if numeric_values:
-                summary_payload[f'{key}_episode_mean'] = float(np.mean(numeric_values))
+        for key in metric_keys:
+            if key in stat:
+                _add_metric(payload, key, stat[key])
+        # Also log unlearning-specific metrics.
+        for extra_key in ['unlearn_loss', 'unlearn_samples']:
+            if extra_key in stat:
+                _add_metric(payload, extra_key, stat[extra_key])
+        wandb.log(payload, step=next_wandb_step)
 
-        wandb.log(summary_payload, step=next_wandb_step)
+    # Final progress update with normalized stats.
+    _print_progress(episodes_completed, args.unlearn_episodes, 'UNLEARN', metrics=stat)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
 
 def save(path):
     # Always treat path as directory and write model.pt inside it

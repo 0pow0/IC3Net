@@ -392,7 +392,7 @@ class Trainer(object):
 
         self.policy_net.train()
         self.mve_net.eval()
-        episode, _ = self.get_episode(epoch)
+        episode, stat = self.get_episode(epoch)
         if len(episode) == 0:
             return None
 
@@ -443,7 +443,9 @@ class Trainer(object):
                 p._grad.data /= samples
         self.unlearn_optimizer.step()
 
-        return {'unlearn_loss': loss.item(), 'unlearn_samples': samples}
+        res = {'unlearn_loss': loss.item(), 'unlearn_samples': samples}
+        res.update(stat)
+        return res
 
     def run_batch(self, epoch):
         batch = []
