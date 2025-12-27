@@ -243,6 +243,22 @@ log['value_loss'] = LogField(list(), True, 'epoch', 'num_steps')
 log['action_loss'] = LogField(list(), True, 'epoch', 'num_steps')
 log['entropy'] = LogField(list(), True, 'epoch', 'num_steps')
 
+# Unlearning log
+unlearn_log = dict()
+unlearn_log['epoch'] = LogField(list(), False, None, None)
+unlearn_log['reward'] = LogField(list(), True, 'epoch', 'num_episodes')
+unlearn_log['enemy_reward'] = LogField(list(), True, 'epoch', 'num_episodes')
+unlearn_log['success'] = LogField(list(), True, 'epoch', 'num_episodes')
+unlearn_log['steps_taken'] = LogField(list(), True, 'epoch', 'num_episodes')
+unlearn_log['add_rate'] = LogField(list(), True, 'epoch', 'num_episodes')
+unlearn_log['comm_action'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['enemy_comm'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['value_loss'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['action_loss'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['entropy'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['unlearn_loss'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['unlearn_samples'] = LogField(list(), True, 'epoch', None)
+
 if args.plot:
     vis = visdom.Visdom(env=args.plot_env)
 
@@ -348,36 +364,112 @@ def run_mve_phase():
     if not args.enable_mve or args.mve_train_steps <= 0:
         return
 
-    if not hasattr(trainer, 'train_mve_step'):
+    target_trainer = trainer.trainer if isinstance(trainer, MultiProcessTrainer) else trainer
+    if not hasattr(target_trainer, 'train_mve_step'):
         print("MVE components not initialized; skipping MVE phase.")
         return
 
-    print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {getattr(trainer, 'mve_buffer', None) and len(trainer.mve_buffer)}")
-    mve_logs = []
+    print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {getattr(target_trainer, 'mve_buffer', None) and len(target_trainer.mve_buffer)}")
+    mve_log = dict()
+    mve_log['mve_step'] = LogField(list(), False, None, None)
+    mve_log['epoch'] = LogField(list(), False, None, None)
+    mve_log['epoch_time'] = LogField(list(), False, None, None)
+    mve_log['mve_loss'] = LogField(list(), True, 'mve_step', None)
+    mve_log['mve_samples'] = LogField(list(), True, 'mve_step', None)
+    mve_log['value_loss'] = LogField(list(), True, 'mve_step', 'num_steps')
+    mve_log['action_loss'] = LogField(list(), True, 'mve_step', 'num_steps')
+    mve_log['entropy'] = LogField(list(), True, 'mve_step', 'num_steps')
+    mve_log['reward'] = LogField(list(), True, 'mve_step', 'num_episodes')
+    mve_log['success'] = LogField(list(), True, 'mve_step', 'num_episodes')
+    mve_log['steps_taken'] = LogField(list(), True, 'mve_step', 'num_episodes')
+    mve_log['comm_action'] = LogField(list(), True, 'mve_step', 'num_steps')
     next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
     for step in range(args.mve_train_steps):
-        res = trainer.train_mve_step()
+        step_begin_time = time.time()
+        stat = dict()
+        res = target_trainer.train_mve_step(step)
         if res is None:
             print("MVE training halted early due to insufficient samples.")
             break
-        mve_logs.append(res)
-        _print_progress(step + 1, args.mve_train_steps, 'MVE    ', metrics=res)
+        merge_stat(res, stat)
+
+        step_time = time.time() - step_begin_time
+        mve_step = len(mve_log['mve_step'].data) + 1
+        stat['epoch'] = mve_step
+        stat['epoch_time'] = step_time
+        if 'reward' in stat and 'reward_mean' not in stat:
+            reward_mean = _vector_mean(stat['reward'])
+            if reward_mean is not None:
+                stat['reward_mean'] = reward_mean
+        if 'comm_action' in stat and 'comm_action_mean' not in stat:
+            comm_action_mean = _vector_mean(stat['comm_action'])
+            if comm_action_mean is not None:
+                stat['comm_action_mean'] = comm_action_mean
+        for k, v in mve_log.items():
+            if k == 'mve_step':
+                v.data.append(mve_step)
+            elif k == 'epoch':
+                v.data.append(stat['epoch'])
+            else:
+                if k in stat and v.divide_by is not None and stat[v.divide_by] > 0:
+                    stat[k] = stat[k] / stat[v.divide_by]
+                v.data.append(stat.get(k, 0))
+
+        np.set_printoptions(precision=2)
+
+        if 'mve_loss' in stat:
+            print('MVE Step {}\tMVE Loss {:.4f}\tTime {:.2f}s'.format(
+                    mve_step, stat['mve_loss'], step_time
+            ))
+        else:
+            print('MVE Step {}\tTime {:.2f}s'.format(
+                    mve_step, step_time
+            ))
+
+        if 'mve_samples' in stat:
+            print('MVE Samples: {}'.format(stat['mve_samples']))
+
+        # Print policy stats (policy performance monitoring during MVE training)
+        if 'reward' in stat:
+            print('Reward: {}'.format(stat['reward']))
+        if 'success' in stat:
+            print('Success: {:.2f}'.format(stat['success']))
+        if 'steps_taken' in stat:
+            print('Steps-taken: {:.2f}'.format(stat['steps_taken']))
+        if 'comm_action' in stat:
+            print('Comm-Action: {}'.format(stat['comm_action']))
+
+        if args.plot:
+            for k, v in mve_log.items():
+                if v.plot and len(v.data) > 0:
+                    vis.line(np.asarray(v.data), np.asarray(mve_log[v.x_axis].data[-len(v.data):]),
+                    win=k, opts=dict(xlabel=v.x_axis, ylabel=k))
+
         if wandb_run is not None:
             next_wandb_step += 1
-            payload = {'mve_step': step + 1}
-            payload.update(res)
+            payload = {
+                'mve_step': mve_step,
+                'mve_step_time': step_time,
+                'epoch': stat['epoch'],
+                'epoch_time': stat['epoch_time']
+            }
+            for key in ['mve_loss', 'mve_samples', 'value_loss', 'action_loss', 'entropy',
+                        'reward', 'success', 'steps_taken', 'comm_action']:
+                if key in stat:
+                    _add_metric(payload, key, stat[key])
             wandb.log(payload, step=next_wandb_step)
+        _print_progress(step + 1, args.mve_train_steps, 'MVE    ')
     if args.mve_train_steps > 0:
         sys.stdout.write('\n')
         sys.stdout.flush()
-    if mve_logs and wandb_run is not None:
-        avg_loss = np.mean([entry['mve_loss'] for entry in mve_logs if 'mve_loss' in entry])
-        total_samples = sum(entry.get('mve_samples', 0) for entry in mve_logs)
+    if mve_log['mve_loss'].data and wandb_run is not None:
+        avg_loss = np.mean(mve_log['mve_loss'].data)
+        total_samples = sum(mve_log['mve_samples'].data)
         next_wandb_step += 1
         wandb.log({
             'mve_avg_loss': avg_loss,
             'mve_total_samples': total_samples,
-            'mve_steps_completed': len(mve_logs)
+            'mve_steps_completed': len(mve_log['mve_step'].data)
         }, step=next_wandb_step)
 
 def run_unlearning_phase():
@@ -390,51 +482,64 @@ def run_unlearning_phase():
         return
 
     print(f"Starting value-aware unlearning for {args.unlearn_episodes} episodes.")
-    stat = dict()
-    episodes_completed = 0
     next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
-    metric_keys = ['reward', 'enemy_reward', 'add_rate', 'success', 'steps_taken',
-                   'comm_action', 'enemy_comm', 'value_loss', 'action_loss', 'entropy']
+
     for ep in range(args.unlearn_episodes):
+        epoch_begin_time = time.time()
+        stat = dict()
+
         res = target_trainer.train_value_unlearning_episode(ep)
         if res is None:
             print("Unlearning halted early due to missing samples or comm actions.")
             break
-        res = dict(res)
-        res.setdefault('num_episodes', 1)
         merge_stat(res, stat)
-        episodes_completed += 1
-        _print_progress(ep + 1, args.unlearn_episodes, 'UNLEARN', metrics=res)
 
-    if episodes_completed == 0:
-        return
+        epoch_time = time.time() - epoch_begin_time
+        epoch = len(unlearn_log['epoch'].data) + 1
+        for k, v in unlearn_log.items():
+            if k == 'epoch':
+                v.data.append(epoch)
+            else:
+                if k in stat and v.divide_by is not None and stat[v.divide_by] > 0:
+                    stat[k] = stat[k] / stat[v.divide_by]
+                v.data.append(stat.get(k, 0))
 
-    # Normalize aggregated stats using the same divide_by logic as training.
-    for key, field in log.items():
-        if key == 'epoch' or field.divide_by is None:
-            continue
-        if key in stat and field.divide_by in stat and stat[field.divide_by] > 0:
-            stat[key] = stat[key] / stat[field.divide_by]
+        np.set_printoptions(precision=2)
 
-    # Log aggregated unlearning metrics once, mirroring training's wandb payload.
-    if wandb_run is not None:
-        next_wandb_step += 1
-        payload = {
-            'unlearn_episodes_completed': episodes_completed
-        }
-        for key in metric_keys:
-            if key in stat:
-                _add_metric(payload, key, stat[key])
-        # Also log unlearning-specific metrics.
-        for extra_key in ['unlearn_loss', 'unlearn_samples']:
-            if extra_key in stat:
-                _add_metric(payload, extra_key, stat[extra_key])
-        wandb.log(payload, step=next_wandb_step)
+        print('Epoch {}\tReward {}\tTime {:.2f}s'.format(
+                epoch, stat['reward'], epoch_time
+        ))
 
-    # Final progress update with normalized stats.
-    _print_progress(episodes_completed, args.unlearn_episodes, 'UNLEARN', metrics=stat)
-    sys.stdout.write('\n')
-    sys.stdout.flush()
+        if 'enemy_reward' in stat.keys():
+            print('Enemy-Reward: {}'.format(stat['enemy_reward']))
+        if 'add_rate' in stat.keys():
+            print('Add-Rate: {:.2f}'.format(stat['add_rate']))
+        if 'success' in stat.keys():
+            print('Success: {:.2f}'.format(stat['success']))
+        if 'steps_taken' in stat.keys():
+            print('Steps-taken: {:.2f}'.format(stat['steps_taken']))
+        if 'comm_action' in stat.keys():
+            print('Comm-Action: {}'.format(stat['comm_action']))
+        if 'enemy_comm' in stat.keys():
+            print('Enemy-Comm: {}'.format(stat['enemy_comm']))
+
+        if args.plot:
+            for k, v in unlearn_log.items():
+                if v.plot and len(v.data) > 0:
+                    vis.line(np.asarray(v.data), np.asarray(unlearn_log[v.x_axis].data[-len(v.data):]),
+                    win=k, opts=dict(xlabel=v.x_axis, ylabel=k))
+
+        if wandb_run is not None:
+            next_wandb_step += 1
+            payload = {'epoch': epoch, 'epoch_time': epoch_time}
+            # Only log keys that were computed in this epoch
+            for key in ['reward', 'enemy_reward', 'add_rate', 'success', 'steps_taken',
+                        'comm_action', 'enemy_comm', 'value_loss', 'action_loss', 'entropy',
+                        'unlearn_loss', 'unlearn_samples']:
+                if key in stat:
+                    _add_metric(payload, key, stat[key])
+            wandb.log(payload, step=next_wandb_step)
+        _print_progress(ep + 1, args.unlearn_episodes, 'Unlearning')
 
 def save(path):
     # Always treat path as directory and write model.pt inside it

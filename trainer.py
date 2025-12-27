@@ -303,6 +303,104 @@ class Trainer(object):
 
         return stat
 
+    def compute_policy_stats(self, batch):
+        """Compute policy loss statistics WITHOUT calling backward.
+
+        This is used for logging purposes when we don't want to affect gradients.
+        Returns the same stats as compute_grad but without the backward pass.
+
+        Returns:
+            stat: Dict with 'action_loss', 'value_loss', 'entropy' as scalars
+        """
+        stat = dict()
+        num_actions = self.args.num_actions
+        dim_actions = self.args.dim_actions
+
+        n = self.args.nagents
+        batch_size = len(batch.state)
+
+        rewards = torch.Tensor(batch.reward)
+        episode_masks = torch.Tensor(batch.episode_mask)
+        episode_mini_masks = torch.Tensor(batch.episode_mini_mask)
+        actions = torch.Tensor(batch.action)
+        actions = actions.transpose(1, 2).view(-1, n, dim_actions)
+
+        # can't do batch forward.
+        values = torch.cat(batch.value, dim=0)
+        action_out = list(zip(*batch.action_out))
+        action_out = [torch.cat(a, dim=0) for a in action_out]
+
+        alive_masks = torch.Tensor(np.concatenate([item['alive_mask'] for item in batch.misc])).view(-1)
+
+        coop_returns = torch.Tensor(batch_size, n)
+        ncoop_returns = torch.Tensor(batch_size, n)
+        returns = torch.Tensor(batch_size, n)
+        deltas = torch.Tensor(batch_size, n)
+        advantages = torch.Tensor(batch_size, n)
+        values = values.view(batch_size, n)
+
+        prev_coop_return = 0
+        prev_ncoop_return = 0
+        prev_value = 0
+        prev_advantage = 0
+
+        for i in reversed(range(rewards.size(0))):
+            coop_returns[i] = rewards[i] + self.args.gamma * prev_coop_return * episode_masks[i]
+            ncoop_returns[i] = rewards[i] + self.args.gamma * prev_ncoop_return * episode_masks[i] * episode_mini_masks[i]
+
+            prev_coop_return = coop_returns[i].clone()
+            prev_ncoop_return = ncoop_returns[i].clone()
+
+            returns[i] = (self.args.mean_ratio * coop_returns[i].mean()) \
+                        + ((1 - self.args.mean_ratio) * ncoop_returns[i])
+
+
+        for i in reversed(range(rewards.size(0))):
+            advantages[i] = returns[i] - values.data[i]
+
+        if self.args.normalize_rewards:
+            advantages = (advantages - advantages.mean()) / advantages.std()
+
+        if self.args.continuous:
+            action_means, action_log_stds, action_stds = action_out
+            log_prob = normal_log_density(actions, action_means, action_log_stds, action_stds)
+        else:
+            log_p_a = [action_out[i].view(-1, num_actions[i]) for i in range(dim_actions)]
+            actions = actions.contiguous().view(-1, dim_actions)
+
+            if self.args.advantages_per_action:
+                log_prob = multinomials_log_densities(actions, log_p_a)
+            else:
+                log_prob = multinomials_log_density(actions, log_p_a)
+
+        if self.args.advantages_per_action:
+            action_loss = -advantages.view(-1).unsqueeze(-1) * log_prob
+            action_loss *= alive_masks.unsqueeze(-1)
+        else:
+            action_loss = -advantages.view(-1) * log_prob.squeeze()
+            action_loss *= alive_masks
+
+        action_loss = action_loss.sum()
+        stat['action_loss'] = action_loss.item()
+
+        # value loss term
+        targets = returns
+        value_loss = (values - targets).pow(2).view(-1)
+        value_loss *= alive_masks
+        value_loss = value_loss.sum()
+
+        stat['value_loss'] = value_loss.item()
+
+        if not self.args.continuous:
+            # entropy regularization term
+            entropy = 0
+            for i in range(len(log_p_a)):
+                entropy -= (log_p_a[i] * log_p_a[i].exp()).sum()
+            stat['entropy'] = entropy.item()
+
+        # Do NOT call backward here - that's the key difference from compute_grad
+        return stat
+
     def _compute_delta_q(self, sample, agent_idx):
         comm_action = sample.get('comm_action', None)
         if comm_action is None:
@@ -341,13 +439,14 @@ class Trainer(object):
         q_null = null_value.view(state.shape[0], self.args.nagents, -1)[0, agent_idx, 0]
         return q_real - q_null
 
-    def train_mve_step(self):
+    def train_mve_step(self, epoch=0):
         if self.mve_buffer is None or self.mve_net is None:
             return None
 
         if len(self.mve_buffer) < self.args.mve_batch_size:
             return None
 
+        # Train MVE network from replay buffer
         transitions = self.mve_buffer.sample(self.args.mve_batch_size)
         preds = []
         targets = []
@@ -379,7 +478,17 @@ class Trainer(object):
         loss.backward()
         self.mve_optimizer.step()
 
-        return {'mve_loss': loss.item(), 'mve_samples': preds.numel()}
+        res = {'mve_loss': loss.item(), 'mve_samples': preds.numel()}
+
+        # Collect policy stats for logging (policy is frozen during MVE training)
+        # Run an episode to get current policy performance
+        batch, stat = self.run_batch(epoch)
+        if len(batch.state) > 0:
+            policy_stats = self.compute_policy_stats(batch)
+            merge_stat(policy_stats, res)
+            res.update(stat)
+
+        return res
 
     def train_value_unlearning_episode(self, epoch):
         if not self.unlearning_enabled or self.unlearn_optimizer is None or self.mve_net is None:
@@ -392,14 +501,14 @@ class Trainer(object):
 
         self.policy_net.train()
         self.mve_net.eval()
-        episode, stat = self.get_episode(epoch)
-        if len(episode) == 0:
+        batch, stat = self.run_batch(epoch)
+        if len(batch.state) == 0:
             return None
 
         loss_terms = []
         samples = 0
-        for trans in episode:
-            misc = trans.misc if isinstance(trans.misc, dict) else dict()
+        for idx in range(len(batch.state)):
+            misc = batch.misc[idx] if isinstance(batch.misc[idx], dict) else dict()
             hidden_repr = misc.get('hidden_repr', None)
             comm_action = misc.get('comm_action', None)
             alive_mask = misc.get('alive_mask', None)
@@ -407,10 +516,11 @@ class Trainer(object):
             if hidden_repr is None or comm_action is None:
                 continue
 
-            if trans.action_out is None or len(trans.action_out) <= comm_head_idx:
+            action_out = batch.action_out[idx]
+            if action_out is None or len(action_out) <= comm_head_idx:
                 continue
 
-            comm_logits = trans.action_out[comm_head_idx]
+            comm_logits = action_out[comm_head_idx]
             log_probs = comm_logits.view(-1, self.args.nagents, self.args.num_actions[comm_head_idx])
             hidden_repr = hidden_repr.view(-1, self.args.nagents, self.args.hid_size)
             comm_action_arr = np.asarray(comm_action).reshape(-1)
@@ -445,6 +555,11 @@ class Trainer(object):
 
         res = {'unlearn_loss': loss.item(), 'unlearn_samples': samples}
         res.update(stat)
+
+        # Collect policy stats (value/action/entropy) without affecting gradients, to mirror main training logs.
+        policy_stats = self.compute_policy_stats(batch)
+        merge_stat(policy_stats, res)
+
         return res
 
     def run_batch(self, epoch):
