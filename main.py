@@ -70,6 +70,8 @@ parser.add_argument('--unlearn_lr', type=float, default=None,
                     help='Learning rate for value-aware unlearning (defaults to lrate).')
 parser.add_argument('--unlearn_lambda', type=float, default=0.0,
                     help='Sparsity penalty applied to message magnitude during unlearning.')
+parser.add_argument('--unlearn_anchor_beta', type=float, default=0.0,
+                    help='Weight for action anchoring loss (KL divergence from base policy) during unlearning.')
 # environment
 parser.add_argument('--env_name', default="Cartpole",
                     help='name of the environment to run')
@@ -257,6 +259,8 @@ unlearn_log['value_loss'] = LogField(list(), True, 'epoch', 'num_steps')
 unlearn_log['action_loss'] = LogField(list(), True, 'epoch', 'num_steps')
 unlearn_log['entropy'] = LogField(list(), True, 'epoch', 'num_steps')
 unlearn_log['unlearn_loss'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['unlearn_comm_loss'] = LogField(list(), True, 'epoch', 'num_steps')
+unlearn_log['unlearn_anchor_loss'] = LogField(list(), True, 'epoch', 'num_steps')
 unlearn_log['unlearn_samples'] = LogField(list(), True, 'epoch', None)
 
 if args.plot:
@@ -472,7 +476,7 @@ def run_mve_phase():
             'mve_steps_completed': len(mve_log['mve_step'].data)
         }, step=next_wandb_step)
 
-def run_unlearning_phase():
+def run_unlearning_phase(base_policy=None):
     if not args.enable_unlearning or args.unlearn_episodes <= 0:
         return
 
@@ -481,14 +485,15 @@ def run_unlearning_phase():
         print("Unlearning components not initialized; skipping value-aware unlearning.")
         return
 
-    print(f"Starting value-aware unlearning for {args.unlearn_episodes} episodes.")
+    anchor_msg = f" with action anchoring (beta={args.unlearn_anchor_beta})" if base_policy is not None and args.unlearn_anchor_beta > 0 else ""
+    print(f"Starting value-aware unlearning for {args.unlearn_episodes} episodes{anchor_msg}.")
     next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
 
     for ep in range(args.unlearn_episodes):
         epoch_begin_time = time.time()
         stat = dict()
 
-        res = target_trainer.train_value_unlearning_episode(ep)
+        res = target_trainer.train_value_unlearning_episode(ep, base_policy=base_policy)
         if res is None:
             print("Unlearning halted early due to missing samples or comm actions.")
             break
@@ -522,6 +527,10 @@ def run_unlearning_phase():
             print('Comm-Action: {}'.format(stat['comm_action']))
         if 'enemy_comm' in stat.keys():
             print('Enemy-Comm: {}'.format(stat['enemy_comm']))
+        if 'unlearn_comm_loss' in stat.keys():
+            print('Unlearn-Comm-Loss: {:.4f}'.format(stat['unlearn_comm_loss']))
+        if 'unlearn_anchor_loss' in stat.keys() and stat['unlearn_anchor_loss'] > 0:
+            print('Unlearn-Anchor-Loss: {:.4f}'.format(stat['unlearn_anchor_loss']))
 
         if args.plot:
             for k, v in unlearn_log.items():
@@ -535,7 +544,7 @@ def run_unlearning_phase():
             # Only log keys that were computed in this epoch
             for key in ['reward', 'enemy_reward', 'add_rate', 'success', 'steps_taken',
                         'comm_action', 'enemy_comm', 'value_loss', 'action_loss', 'entropy',
-                        'unlearn_loss', 'unlearn_samples']:
+                        'unlearn_loss', 'unlearn_comm_loss', 'unlearn_anchor_loss', 'unlearn_samples']:
                 if key in stat:
                     _add_metric(payload, key, stat[key])
             wandb.log(payload, step=next_wandb_step)
@@ -577,8 +586,19 @@ if args.load != '':
     load(args.load)
 
 run(args.num_epochs)
+
+# Save a frozen copy of the base policy for action anchoring during unlearning
+base_policy_net = None
+if args.enable_unlearning and args.unlearn_anchor_beta > 0:
+    import copy
+    base_policy_net = copy.deepcopy(policy_net)
+    base_policy_net.eval()
+    for param in base_policy_net.parameters():
+        param.requires_grad = False
+    print(f"Saved frozen base policy for action anchoring (beta={args.unlearn_anchor_beta})")
+
 run_mve_phase()
-run_unlearning_phase()
+run_unlearning_phase(base_policy=base_policy_net)
 if args.display:
     env.end_display()
 

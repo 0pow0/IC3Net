@@ -401,6 +401,85 @@ class Trainer(object):
         # Do NOT call backward here - that's the key difference from compute_grad
         return stat
 
+    def _get_base_policy_actions(self, base_policy, batch):
+        """
+        Rerun the episode through the base policy to get action distributions.
+        Returns a list of action outputs (one per timestep).
+        """
+        if base_policy is None:
+            return None
+
+        action_outs = []
+        prev_hid = torch.zeros(1, self.args.nagents, self.args.hid_size)
+
+        for idx in range(len(batch.state)):
+            state = batch.state[idx]
+            misc = batch.misc[idx] if isinstance(batch.misc[idx], dict) else dict()
+            comm_action = misc.get('comm_action', None)
+
+            # Create info dict for this step
+            info = {}
+            if comm_action is not None:
+                info['comm_action'] = comm_action
+            if 'alive_mask' in misc:
+                info['alive_mask'] = misc['alive_mask']
+
+            # Forward through base policy
+            with torch.no_grad():
+                if self.args.recurrent:
+                    if self.args.rnn_type == 'LSTM' and idx == 0:
+                        prev_hid = base_policy.init_hidden(batch_size=state.shape[0])
+                    action_out, _, prev_hid = base_policy([state, prev_hid], info)
+                else:
+                    action_out, _ = base_policy(state, info)
+
+            action_outs.append(action_out)
+
+        return action_outs
+
+    def _compute_action_kl(self, base_action_out, curr_action_out, agent_idx, comm_head_idx, alive_mask):
+        """
+        Compute KL divergence D_KL(base || curr) for physical actions.
+        Only compute for action heads before comm_head_idx (physical actions).
+        """
+        if base_action_out is None or curr_action_out is None:
+            return None
+
+        kl_sum = 0.0
+        num_heads = 0
+
+        # Iterate over physical action heads (exclude communication action)
+        for head_idx in range(min(len(base_action_out), len(curr_action_out))):
+            if head_idx >= comm_head_idx:
+                # Skip communication action head
+                continue
+
+            base_log_probs = base_action_out[head_idx]
+            curr_log_probs = curr_action_out[head_idx]
+
+            # Extract probabilities for this agent
+            # Shape: [batch, nagents, num_actions]
+            base_log_probs = base_log_probs.view(-1, self.args.nagents, self.args.num_actions[head_idx])
+            curr_log_probs = curr_log_probs.view(-1, self.args.nagents, self.args.num_actions[head_idx])
+
+            # Get probs for specific agent
+            base_log_p = base_log_probs[:, agent_idx, :]
+            curr_log_p = curr_log_probs[:, agent_idx, :]
+
+            # Convert log probs to probs
+            base_p = torch.exp(base_log_p.detach())
+            curr_p = torch.exp(curr_log_p)
+
+            # KL divergence: D_KL(base || curr) = sum(base_p * (log(base_p) - log(curr_p)))
+            kl = (base_p * (base_log_p.detach() - curr_log_p)).sum()
+            kl_sum += kl
+            num_heads += 1
+
+        if num_heads == 0:
+            return None
+
+        return kl_sum / num_heads
+
     def _compute_delta_q(self, sample, agent_idx):
         comm_action = sample.get('comm_action', None)
         if comm_action is None:
@@ -490,7 +569,7 @@ class Trainer(object):
 
         return res
 
-    def train_value_unlearning_episode(self, epoch):
+    def train_value_unlearning_episode(self, epoch, base_policy=None):
         if not self.unlearning_enabled or self.unlearn_optimizer is None or self.mve_net is None:
             return None
 
@@ -501,11 +580,20 @@ class Trainer(object):
 
         self.policy_net.train()
         self.mve_net.eval()
+        if base_policy is not None:
+            base_policy.eval()
+
         batch, stat = self.run_batch(epoch)
         if len(batch.state) == 0:
             return None
 
+        # If using action anchoring, rerun episode through base policy to get base action distributions
+        base_action_outs = None
+        if base_policy is not None and self.args.unlearn_anchor_beta > 0:
+            base_action_outs = self._get_base_policy_actions(base_policy, batch)
+
         loss_terms = []
+        anchor_loss_terms = []
         samples = 0
         for idx in range(len(batch.state)):
             misc = batch.misc[idx] if isinstance(batch.misc[idx], dict) else dict()
@@ -540,20 +628,47 @@ class Trainer(object):
                 log_prob = log_probs[:, agent_idx, int(msg_val)].squeeze()
                 advantage = value_est - self.args.unlearn_lambda * torch.abs(msg_tensor.squeeze())
                 loss_terms.append(-advantage * log_prob)
+
+                # Add action anchoring loss (KL divergence for physical actions)
+                if base_action_outs is not None and idx < len(base_action_outs):
+                    base_action_out = base_action_outs[idx]
+                    curr_action_out = action_out
+
+                    # Compute KL divergence for physical actions (all heads except communication)
+                    kl_loss = self._compute_action_kl(base_action_out, curr_action_out,
+                                                      agent_idx, comm_head_idx, alive_mask)
+                    if kl_loss is not None:
+                        anchor_loss_terms.append(kl_loss)
+
                 samples += 1
 
         if samples == 0 or len(loss_terms) == 0:
             return None
 
-        loss = torch.stack(loss_terms).mean()
+        # Compute communication loss
+        comm_loss = torch.stack(loss_terms).mean()
+
+        # Compute total loss (communication + anchor)
+        total_loss = comm_loss
+        anchor_loss_value = 0.0
+        if len(anchor_loss_terms) > 0 and self.args.unlearn_anchor_beta > 0:
+            anchor_loss = torch.stack(anchor_loss_terms).mean()
+            anchor_loss_value = anchor_loss.item()
+            total_loss = comm_loss + self.args.unlearn_anchor_beta * anchor_loss
+
         self.unlearn_optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         for p in self.params:
             if p._grad is not None:
                 p._grad.data /= samples
         self.unlearn_optimizer.step()
 
-        res = {'unlearn_loss': loss.item(), 'unlearn_samples': samples}
+        res = {
+            'unlearn_loss': total_loss.item(),
+            'unlearn_comm_loss': comm_loss.item(),
+            'unlearn_anchor_loss': anchor_loss_value,
+            'unlearn_samples': samples
+        }
         res.update(stat)
 
         # Collect policy stats (value/action/entropy) without affecting gradients, to mirror main training logs.
