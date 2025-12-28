@@ -401,6 +401,43 @@ class Trainer(object):
         # Do NOT call backward here - that's the key difference from compute_grad
         return stat
 
+    def freeze_all_except_action_heads(self):
+        """
+        Freeze all policy network parameters except specific action heads and value head.
+        This is used during the unlearning phase to only update action selection.
+        """
+        if not hasattr(self.policy_net, 'heads') or not hasattr(self.policy_net, 'value_head'):
+            print("Warning: Policy network doesn't have 'heads' or 'value_head' attributes. Skipping selective freezing.")
+            return
+
+        # Freeze all parameters
+        for param in self.policy_net.parameters():
+            param.requires_grad = False
+
+        # Unfreeze heads[0] (first action head)
+        if len(self.policy_net.heads) > 0:
+            for param in self.policy_net.heads[0].parameters():
+                param.requires_grad = True
+            print(f"Unfroze heads[0] for unlearning phase")
+
+        # Unfreeze heads[1] (second action head, often the communication head)
+        if len(self.policy_net.heads) > 1:
+            for param in self.policy_net.heads[1].parameters():
+                param.requires_grad = True
+            print(f"Unfroze heads[1] for unlearning phase")
+
+        # Unfreeze value_head
+        for param in self.policy_net.value_head.parameters():
+            param.requires_grad = True
+        print(f"Unfroze value_head for unlearning phase")
+
+        # Recreate optimizer with only unfrozen parameters
+        unfrozen_params = [p for p in self.policy_net.parameters() if p.requires_grad]
+        print(f"Total unfrozen parameters for unlearning: {sum(p.numel() for p in unfrozen_params)}")
+
+        lr = self.args.unlearn_lr if getattr(self.args, 'unlearn_lr', None) not in (None, 0) else self.args.lrate
+        self.unlearn_optimizer = optim.RMSprop(unfrozen_params, lr=lr, alpha=0.97, eps=1e-6)
+
     def _compute_delta_q(self, sample, agent_idx):
         comm_action = sample.get('comm_action', None)
         if comm_action is None:

@@ -70,6 +70,8 @@ parser.add_argument('--unlearn_lr', type=float, default=None,
                     help='Learning rate for value-aware unlearning (defaults to lrate).')
 parser.add_argument('--unlearn_lambda', type=float, default=0.0,
                     help='Sparsity penalty applied to message magnitude during unlearning.')
+parser.add_argument('--objective', type=str, default='original',
+                    help='Training objective: "original" (all params), "test" (eval mode), or "selective" (only action heads during unlearning)')
 # environment
 parser.add_argument('--env_name', default="Cartpole",
                     help='name of the environment to run')
@@ -480,6 +482,22 @@ def run_unlearning_phase():
     if not hasattr(target_trainer, 'train_value_unlearning_episode') or target_trainer.unlearn_optimizer is None:
         print("Unlearning components not initialized; skipping value-aware unlearning.")
         return
+
+    # Apply parameter freezing based on objective setting
+    if args.objective == "test":
+        for param in policy_net.parameters():
+            param.requires_grad = False
+        policy_net.eval()
+        print("Set policy to eval mode (test objective)")
+    elif args.objective == "selective":
+        # Freeze all parameters except action heads and value head
+        print("Freezing policy parameters for selective unlearning (only action heads + value head will be trained)")
+        target_trainer.freeze_all_except_action_heads()
+    else:
+        # "original" - keep all parameters trainable
+        for param in policy_net.parameters():
+            param.requires_grad = True
+        print("All parameters trainable (original objective)")
 
     print(f"Starting value-aware unlearning for {args.unlearn_episodes} episodes.")
     next_wandb_step = getattr(wandb.run, 'step', 0) if wandb_run is not None else 0
