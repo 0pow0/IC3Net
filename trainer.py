@@ -32,6 +32,10 @@ class ReplayBuffer(object):
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
 
+    def clear(self):
+        self.buffer = []
+        self.position = 0
+
 
 class Trainer(object):
     def __init__(self, args, policy_net, env):
@@ -517,6 +521,33 @@ class Trainer(object):
 
         q_null = null_value.view(state.shape[0], self.args.nagents, -1)[0, agent_idx, 0]
         return q_real - q_null
+
+    def fill_mve_buffer(self, target_size=None):
+        """Clear and refill MVE buffer with fresh on-policy transitions.
+
+        This should be called at the start of MVE phase to ensure the buffer
+        only contains transitions from the final converged policy, not stale
+        data from intermediate policies during pre-training.
+        """
+        if self.mve_buffer is None:
+            return 0
+
+        if target_size is None:
+            target_size = self.args.mve_buffer_size
+
+        # Clear stale transitions from pre-training
+        self.mve_buffer.clear()
+
+        # Collect fresh transitions with the current (converged) policy
+        self.policy_net.eval()
+        episodes_collected = 0
+        while len(self.mve_buffer) < target_size:
+            episode, _ = self.get_episode(epoch=0)
+            episodes_collected += 1
+            # Transitions are automatically stored via _store_mve_transition in get_episode
+
+        self.policy_net.train()
+        return len(self.mve_buffer)
 
     def train_mve_step(self, epoch=0):
         if self.mve_buffer is None or self.mve_net is None:

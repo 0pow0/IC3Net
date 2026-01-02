@@ -373,7 +373,13 @@ def run_mve_phase():
         print("MVE components not initialized; skipping MVE phase.")
         return
 
-    print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {getattr(target_trainer, 'mve_buffer', None) and len(target_trainer.mve_buffer)}")
+    # Clear stale transitions from pre-training and refill with fresh on-policy data
+    # This ensures MVE learns value differences for the final converged policy only
+    print("Clearing MVE buffer and collecting fresh on-policy transitions...")
+    buffer_size = target_trainer.fill_mve_buffer()
+    print(f"Collected {buffer_size} fresh transitions from converged policy")
+
+    print(f"Starting MVE training for {args.mve_train_steps} steps using replay buffer of size {buffer_size}")
     mve_log = dict()
     mve_log['mve_step'] = LogField(list(), False, None, None)
     mve_log['epoch'] = LogField(list(), False, None, None)
