@@ -29,6 +29,10 @@ def init(env_name, args, final_init=True):
         env = gym.make('StarCraftWrapper-v0')
         env.multi_agent_init(args, final_init)
         env = GymWrapper(env.env)
+    elif env_name == 'smac':
+        env = gym.make('SMAC-v0')
+        env.multi_agent_init(args)
+        env = GymWrapper(env)
 
     else:
         raise RuntimeError("wrong env name")

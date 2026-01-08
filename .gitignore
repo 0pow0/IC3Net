@@ -105,4 +105,9 @@ ENV/
 *.pt
 
 .vscode
+.claude/
 jobs/
+deps/
+wandb/
+3rdparty/
+__MACOSX/

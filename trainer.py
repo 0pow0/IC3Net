@@ -83,6 +83,10 @@ class Trainer(object):
 
         prev_hid = torch.zeros(1, self.args.nagents, self.args.hid_size)
 
+        # Get initial available actions for SMAC environments
+        if hasattr(self.env.env, 'get_avail_actions'):
+            info['avail_actions'] = self.env.env.get_avail_actions()
+
         for t in range(self.args.max_steps):
             misc = dict()
             hidden_repr = None
@@ -116,7 +120,9 @@ class Trainer(object):
                 else:
                     action_out, value = self.policy_net(x, info)
 
-            action = select_action(self.args, action_out)
+            # Get available actions for masking (SMAC environments)
+            avail_actions = info.get('avail_actions', None)
+            action = select_action(self.args, action_out, avail_actions)
             action, actual = translate_action(self.args, self.env, action)
             next_state, reward, done, info = self.env.step(actual)
 

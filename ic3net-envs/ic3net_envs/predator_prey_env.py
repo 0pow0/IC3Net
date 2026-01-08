@@ -42,6 +42,13 @@ class PredatorPreyEnv(gym.Env):
         self.POS_PREY_REWARD = 0.05
         self.episode_over = False
 
+        # Set placeholder spaces to satisfy gym's environment checker
+        # These will be properly initialized in multi_agent_init()
+        self.action_space = spaces.Discrete(1)
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(1,), dtype=np.float32
+        )
+
     def init_curses(self):
         self.stdscr = curses.initscr()
         curses.start_color()

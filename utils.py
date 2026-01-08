@@ -110,7 +110,8 @@ def init_args_for_env(parser):
         'number_pairs': 'NumberPairs-v0',
         'predator_prey': 'PredatorPrey-v0',
         'traffic_junction': 'TrafficJunction-v0',
-        'starcraft': 'StarCraftWrapper-v0'
+        'starcraft': 'StarCraftWrapper-v0',
+        'smac': 'SMAC-v0'
     }
 
     args = sys.argv

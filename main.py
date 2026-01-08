@@ -150,6 +150,16 @@ if args.ic3net:
     # importance of individual rewards even in cooperative games
     if args.env_name == "traffic_junction":
         args.comm_action_one = True
+
+# SMAC: Set nagents from map configuration
+if args.env_name == "smac":
+    from smac.env import StarCraft2Env
+    temp_env = StarCraft2Env(map_name=args.map_name)
+    env_info = temp_env.get_env_info()
+    args.nagents = env_info['n_agents']
+    temp_env.close()
+    print(f"SMAC map '{args.map_name}' has {args.nagents} agents")
+
 # Enemy comm
 args.nfriendly = args.nagents
 if hasattr(args, 'enemy_comm') and args.enemy_comm:
@@ -167,6 +177,11 @@ args.num_actions = env.num_actions
 if not isinstance(args.num_actions, (list, tuple)): # single action case
     args.num_actions = [args.num_actions]
 args.dim_actions = env.dim_actions
+
+# If num_actions has fewer elements than dim_actions, replicate the first element
+# This handles MultiDiscrete action spaces where all agents have the same number of actions
+if len(args.num_actions) == 1 and args.dim_actions > 1:
+    args.num_actions = args.num_actions * args.dim_actions
 args.num_inputs = num_inputs
 
 # Hard attention
